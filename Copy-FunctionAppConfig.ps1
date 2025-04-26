@@ -1,12 +1,13 @@
-#Requires -Module Az.Websites
-#Requires -Module Az.Accounts
+#Requires -Version 5.1
+
 <#
 .SYNOPSIS
   Copies configuration (Application Settings & Connection Strings) from a source
-  Azure Function App to an existing target Azure Function App.
+  Azure Function App in one subscription to an existing target Azure Function App in another subscription.
+
 .DESCRIPTION
   This script retrieves Application Settings and Connection Strings from a specified
-  source Function App and applies them to a specified target Function App.
+  source Function App in one Azure subscription and applies them to a specified target Function App in a different Azure subscription.
   It assumes the target Function App already exists.
   IMPORTANT:
   - This script DOES NOT create any resources (Function App, Plan, etc.).
@@ -16,20 +17,34 @@
     environment (like storage accessible via Private Endpoint in ASE).
   - You MUST manually configure permissions for the target Function App's
     Managed Identity after running this script.
+
 .PARAMETER SourceFunctionAppName
   The name of the existing source Function App to copy configuration FROM.
+
 .PARAMETER SourceResourceGroupName
   The resource group name of the source Function App.
+
 .PARAMETER TargetFunctionAppName
   The name of the existing target Function App (in the ASE) to copy configuration TO.
+
 .PARAMETER TargetResourceGroupName
   The resource group name of the target Function App.
+
+.PARAMETER SourceSubscriptionId
+  The subscription ID of the Azure subscription containing the source Function App.
+
+.PARAMETER TargetSubscriptionId
+  The subscription ID of the Azure subscription containing the target Function App.
+
 .EXAMPLE
   .\Copy-FunctionAppConfig.ps1 `
-      -SourceFunctionAppName "func-certs-prod-so4d" `
-      -SourceResourceGroupName "rg-certs-prod" `
-      -TargetFunctionAppName "func-certs-prod-ase" `
-      -TargetResourceGroupName "rg-certs-prod-ase"
+      -SourceFunctionAppName "func-source-app" `
+      -SourceResourceGroupName "source-rg" `
+      -SourceSubscriptionId "source-subscription-id" `
+      -TargetFunctionAppName "func-target-app" `
+      -TargetResourceGroupName "target-rg" `
+      -TargetSubscriptionId "target-subscription-id"
+
 .NOTES
   Author: Barry Bahrami / AI Assistant
   Date:   2023-10-27
@@ -42,17 +57,57 @@ param(
     [Parameter(Mandatory=$true)]
     [string]$TargetFunctionAppName,
     [Parameter(Mandatory=$true)]
-    [string]$TargetResourceGroupName
+    [string]$TargetResourceGroupName,
+    [Parameter(Mandatory=$true)]
+    [string]$SourceSubscriptionId,
+    [Parameter(Mandatory=$true)]
+    [string]$TargetSubscriptionId
 )
+
+# Function to check and install modules
+function Install-ModuleIfNeeded {
+    param (
+        [string]$ModuleName
+    )
+    if (-not (Get-Module -ListAvailable -Name $ModuleName)) {
+        Write-Host "Installing module $ModuleName..."
+        Install-Module -Name $ModuleName -Scope CurrentUser -Force -AllowClobber
+    } else {
+        Write-Host "$ModuleName is already installed."
+    }
+}
+
+# Ensure Az.Accounts is installed (for authentication)
+Install-ModuleIfNeeded -ModuleName Az.Accounts
+
+# Connect to Azure if not already connected
+try {
+    Get-AzContext -ErrorAction Stop
+} catch {
+    Write-Host "Connecting to Azure..."
+    Connect-AzAccount
+}
+
+# Ensure Az.Websites is installed (for function app operations)
+Install-ModuleIfNeeded -ModuleName Az.Websites
+
+# Ensure Az.Functions is installed (for Get-AzFunctionApp cmdlet)
+Install-ModuleIfNeeded -ModuleName Az.Functions
+
+# Import the modules to ensure they are loaded
+Import-Module Az.Accounts, Az.Websites, Az.Functions -Force
+
 # --- Script Start ---
-# Connect to Azure (uncomment if running locally and not already connected)
-# Connect-AzAccount
-# Set-AzContext -SubscriptionId "YOUR_SUBSCRIPTION_ID" # Optional: Specify subscription
 Write-Host "Starting Function App configuration copy..."
+
+# Set contexts for different subscriptions
+Write-Host "Setting context for Source Subscription..."
+Set-AzContext -SubscriptionId $SourceSubscriptionId -ErrorAction Stop
+
 Write-Host "Source App: $SourceFunctionAppName in $SourceResourceGroupName"
-Write-Host "Target App: $TargetFunctionAppName in $TargetResourceGroupName"
 # --- Validate Inputs ---
-Write-Host "Validating resources..."
+Write-Host "Validating source resources..."
+
 # Get Source Function App (to ensure it exists)
 $sourceApp = Get-AzFunctionApp -Name $SourceFunctionAppName -ResourceGroupName $SourceResourceGroupName -ErrorAction SilentlyContinue
 if (-not $sourceApp) {
@@ -60,6 +115,13 @@ if (-not $sourceApp) {
     exit 1
 }
 Write-Host " -> Source Function App found."
+
+# Now set context for Target Subscription
+Write-Host "Setting context for Target Subscription..."
+Set-AzContext -SubscriptionId $TargetSubscriptionId -ErrorAction Stop
+
+Write-Host "Target App: $TargetFunctionAppName in $TargetResourceGroupName"
+
 # Get Target Function App (to ensure it exists)
 $targetApp = Get-AzFunctionApp -Name $TargetFunctionAppName -ResourceGroupName $TargetResourceGroupName -ErrorAction SilentlyContinue
 if (-not $targetApp) {
@@ -67,9 +129,13 @@ if (-not $targetApp) {
     exit 1
 }
 Write-Host " -> Target Function App found."
+
 # --- Copy Configuration ---
 Write-Host "Retrieving configuration from '$SourceFunctionAppName'..."
 try {
+    # Set context back to Source Subscription for retrieving settings
+    Set-AzContext -SubscriptionId $SourceSubscriptionId -ErrorAction Stop
+
     # Get application settings from source
     $sourceAppSettings = Get-AzFunctionAppSetting -Name $SourceFunctionAppName -ResourceGroupName $SourceResourceGroupName -ErrorAction Stop
     
@@ -77,22 +143,19 @@ try {
     $sourceWebApp = Get-AzWebApp -Name $SourceFunctionAppName -ResourceGroupName $SourceResourceGroupName -ErrorAction Stop
     $sourceConnStrings = $sourceWebApp.SiteConfig.ConnectionStrings
     
+    # Set context back to Target Subscription for applying settings
+    Set-AzContext -SubscriptionId $TargetSubscriptionId -ErrorAction Stop
+
     # --- CRITICAL: Define Settings to Exclude or Modify ---
-    # These settings are often environment-specific or managed by the platform
-    # REVIEW AND ADJUST THIS LIST CAREFULLY!
     $settingsToExclude = @(
-        "WEBSITE_CONTENTAZUREFILECONNECTIONSTRING", # Platform managed
-        "WEBSITE_CONTENTSHARE",                 # Platform managed
-        "WEBSITE_SITE_NAME",                    # Platform managed (will be the target name anyway)
-        "WEBSITE_HOSTNAME",                     # Platform managed (will be the target hostname)
-        "WEBSITE_INSTANCE_ID",                  # Changes per instance
-        # --- Potentially Exclude/Modify ---
-        "AzureWebJobsStorage",                  # VERY LIKELY needs manual update for ASE (Private Endpoint/Managed Identity)
-        "APPINSIGHTS_INSTRUMENTATIONKEY",       # Target app might use different App Insights
-        "APPLICATIONINSIGHTS_CONNECTION_STRING" # Target app might use different App Insights
-        # Add any other source-specific URLs, keys, or settings here
-        # "MyApiUrl",
-        # "LegacyDatabaseConnectionString"
+        "WEBSITE_CONTENTAZUREFILECONNECTIONSTRING",
+        "WEBSITE_CONTENTSHARE",
+        "WEBSITE_SITE_NAME",
+        "WEBSITE_HOSTNAME",
+        "WEBSITE_INSTANCE_ID",
+        "AzureWebJobsStorage",
+        "APPINSIGHTS_INSTRUMENTATIONKEY",
+        "APPLICATIONINSIGHTS_CONNECTION_STRING"
     )
     $appSettingsToCopy = @{}
     Write-Host "Filtering Application Settings..."
@@ -109,13 +172,8 @@ try {
     Write-Host "Processing Connection Strings..."
     if ($sourceConnStrings) {
         foreach ($cs in $sourceConnStrings) {
-             # Decide if you want to exclude specific connection strings by name
-             # if ($cs.Name -ne "MyOldDatabase") {
-                  $connStringsToCopy[$cs.Name] = @{ Type = $cs.Type.ToString(); Value = $cs.ConnectionString }
-                  Write-Verbose " -> Including Connection String: $($cs.Name)"
-             # } else {
-             #    Write-Host " -> Excluding Connection String: $($cs.Name)"
-             # }
+            $connStringsToCopy[$cs.Name] = @{ Type = $cs.Type.ToString(); Value = $cs.ConnectionString }
+            Write-Verbose " -> Including Connection String: $($cs.Name)"
         }
     } else {
         Write-Host " -> No connection strings found on source app."
@@ -140,6 +198,7 @@ try {
     Write-Warning "Please check the settings on the target Function App '$TargetFunctionAppName' manually."
     exit 1
 }
+
 # --- Final Instructions ---
 Write-Host "--------------------------------------------------" -ForegroundColor Green
 Write-Host "SUCCESS: Configuration copied to '$TargetFunctionAppName'." -ForegroundColor Green
@@ -158,7 +217,7 @@ Write-Host "    - Update connection strings/settings (like AzureWebJobsStorage) 
 Write-Host " 3. DEPLOY YOUR CODE:" -ForegroundColor Yellow
 Write-Host "    - This script DID NOT deploy code."
 Write-Host "    - Deploy your function code to '$TargetFunctionAppName' using CI/CD (with VNet agents) or manually from within the VNet."
-Write-Host "    - Remember the SCM endpoint is PRIVATE: $($TargetFunctionAppName).scm.$($targetApp.DefaultHostName.Split('.',2)[1])" # Tries to guess ASE domain part
+Write-Host "    - Remember the SCM endpoint is PRIVATE: $($TargetFunctionAppName).scm.$($targetApp.DefaultHostName.Split('.',2)[1])"
 Write-Host " 4. TEST THOROUGHLY:" -ForegroundColor Yellow
 Write-Host "    - Test function triggers and execution from within the VNet."
 Write-Host " 5. UPDATE CONSUMERS:" -ForegroundColor Yellow
